@@ -1,7 +1,8 @@
 """
 Project ACHILLES — Report Engine
 Generates a daily Market Intelligence Report using the NVIDIA NIM API
-and exports it to Google Docs.
+and saves it as a Markdown file in the reports/ directory.
+The GitHub Actions workflow then commits it back to the repository.
 """
 
 import os
@@ -12,8 +13,6 @@ import datetime
 import traceback
 from pathlib import Path
 from openai import OpenAI
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 
 # ──────────────────────────────────────────────
@@ -21,32 +20,19 @@ from googleapiclient.discovery import build
 # ──────────────────────────────────────────────
 MODEL = "mistralai/mistral-nemotron"
 BASE_URL = "https://integrate.api.nvidia.com/v1"
-MAX_TOKENS = 16384  # ACHILLES Format A reports are long; 4096 truncates them
+MAX_TOKENS = 16384
 TEMPERATURE = 0.6
 TOP_P = 0.7
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 30
 
-# Google Docs batchUpdate has a practical character limit per insertText request.
-# We chunk content at this boundary to avoid silent truncation or 400 errors.
-GOOGLE_DOCS_CHUNK_SIZE = 40000
-
-# JST offset for consistent date/time across the pipeline
+# JST offset (UTC+9) — all dates in the report are Japan time
 JST_OFFSET = datetime.timedelta(hours=9)
 
-REQUIRED_ENV_VARS = ["NVIDIA_API_KEY", "GOOGLE_CREDENTIALS", "GOOGLE_FOLDER_ID"]
+REQUIRED_ENV_VARS = ["NVIDIA_API_KEY"]
 
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive",
-]
-
-# Errors that should NOT be retried — failing fast saves 90s of pointless waiting
-NON_RETRYABLE_ERRORS = (
-    "401",          # Bad API key
-    "403",          # Forbidden / quota exceeded
-    "invalid_api",  # NVIDIA-specific auth failure
-)
+# Non-retryable HTTP error codes — fail immediately, don't waste time
+NON_RETRYABLE_MARKERS = ("401", "403", "invalid_api_key", "authentication")
 
 
 # ──────────────────────────────────────────────
@@ -62,47 +48,36 @@ def jst_today() -> datetime.date:
     return jst_now().date()
 
 
+def is_retryable(error: Exception) -> bool:
+    """Auth and permission errors won't fix themselves — don't retry them."""
+    error_str = str(error).lower()
+    return not any(marker in error_str for marker in NON_RETRYABLE_MARKERS)
+
+
+def resolve_repo_root() -> Path:
+    """Find the repo root whether running locally or in GitHub Actions."""
+    return Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parent.parent))
+
+
 # ──────────────────────────────────────────────
 # GUARDS
 # ──────────────────────────────────────────────
 def validate_environment():
-    """Fail fast if any required secret is missing or malformed."""
+    """Fail fast and clearly if any required secret is missing."""
     missing = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
     if missing:
         print(f"❌ FATAL: Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
-
-    # Validate GOOGLE_CREDENTIALS is parseable JSON before we reach the upload step
-    try:
-        creds = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-        if "client_email" not in creds or "private_key" not in creds:
-            raise ValueError("JSON is valid but missing 'client_email' or 'private_key' fields.")
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"❌ FATAL: GOOGLE_CREDENTIALS is not valid service account JSON: {e}")
-        print("   Ensure you pasted the FULL contents of the .json key file into the GitHub Secret.")
-        sys.exit(1)
-
-    print("✅ All environment variables present and validated.")
+    print("✅ Environment validated.")
 
 
 def resolve_prompt_path() -> Path:
-    """Resolve SystemPrompt.md relative to the repo root, not the script's CWD."""
-    # GitHub Actions checks out to GITHUB_WORKSPACE; local runs use repo root
-    repo_root = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parent.parent))
-    prompt_path = repo_root / "SystemPrompt.md"
+    """Resolve SystemPrompt.md from the repo root."""
+    prompt_path = resolve_repo_root() / "SystemPrompt.md"
     if not prompt_path.exists():
         print(f"❌ FATAL: SystemPrompt.md not found at {prompt_path}")
         sys.exit(1)
     return prompt_path
-
-
-def is_retryable(error: Exception) -> bool:
-    """Check if an error is worth retrying or should fail immediately."""
-    error_str = str(error).lower()
-    for marker in NON_RETRYABLE_ERRORS:
-        if marker.lower() in error_str:
-            return False
-    return True
 
 
 # ──────────────────────────────────────────────
@@ -143,11 +118,10 @@ def generate_report() -> str:
 
             content = completion.choices[0].message.content
 
-            # Validate response isn't empty or garbage
             if not content or len(content.strip()) < 200:
                 raise ValueError(
-                    f"API returned suspiciously short response ({len(content) if content else 0} chars). "
-                    "Likely a model error or content filter."
+                    f"API returned suspiciously short response "
+                    f"({len(content) if content else 0} chars). Possible content filter."
                 )
 
             print(f"✅ Report generated: {len(content):,} characters")
@@ -157,85 +131,54 @@ def generate_report() -> str:
             last_error = e
             print(f"⚠️ Attempt {attempt} failed: {type(e).__name__}: {e}")
 
-            # Don't retry auth or permission errors — they won't resolve on their own
             if not is_retryable(e):
-                print(f"❌ FATAL: Non-retryable error detected. Aborting immediately.")
+                print("❌ FATAL: Non-retryable error (auth/permission). Aborting immediately.")
                 sys.exit(1)
 
             if attempt < MAX_RETRIES:
-                wait = RETRY_DELAY_SECONDS * attempt  # Linear backoff
+                wait = RETRY_DELAY_SECONDS * attempt
                 print(f"   Retrying in {wait}s...")
                 time.sleep(wait)
 
-    # All retries exhausted
     print(f"❌ FATAL: All {MAX_RETRIES} attempts failed. Last error: {last_error}")
     sys.exit(1)
 
 
 # ──────────────────────────────────────────────
-# CORE: GOOGLE DOCS UPLOAD
+# CORE: SAVE REPORT TO REPO
 # ──────────────────────────────────────────────
-def get_google_services():
-    """Authenticate and return Google Docs + Drive service clients."""
-    creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-    creds = service_account.Credentials.from_service_account_info(
-        creds_json, scopes=GOOGLE_SCOPES
+def save_report(content: str) -> Path:
+    """
+    Save the report as a Markdown file in reports/YYYY-MM-DD.md.
+    The GitHub Actions workflow commits this file back to the repo,
+    making it readable by any other workflow via actions/checkout or raw GitHub URL.
+    """
+    repo_root = resolve_repo_root()
+    reports_dir = repo_root / "reports"
+    reports_dir.mkdir(exist_ok=True)
+
+    date_str = jst_today().strftime("%Y-%m-%d")
+    report_path = reports_dir / f"{date_str}.md"
+
+    # Build the full Markdown file with a header
+    header = (
+        f"# ACHILLES Market Intelligence Report\n"
+        f"**Date:** {date_str} (JST)  \n"
+        f"**Generated:** {jst_now().strftime('%Y-%m-%d %H:%M JST')}  \n"
+        f"**Model:** {MODEL}  \n\n"
+        f"---\n\n"
     )
-    docs_service = build("docs", "v1", credentials=creds)
-    drive_service = build("drive", "v3", credentials=creds)
-    return docs_service, drive_service
 
+    report_path.write_text(header + content, encoding="utf-8")
+    print(f"💾 Report saved to: {report_path}")
 
-def upload_to_google_docs(content: str) -> str:
-    """Create a new Google Doc with the report content and move it to the target folder."""
-    docs_service, drive_service = get_google_services()
+    # Also write/update a latest.md symlink-style file so other workflows
+    # can always read the most recent report at a fixed path
+    latest_path = reports_dir / "latest.md"
+    latest_path.write_text(header + content, encoding="utf-8")
+    print(f"📌 Latest report also written to: {latest_path}")
 
-    # Use JST date for the title so it matches the report's actual day in Japan
-    title = f"ACHILLES Report — {jst_today().strftime('%Y-%m-%d')}"
-    print(f"📝 Creating Google Doc: '{title}'...")
-    doc = docs_service.documents().create(body={"title": title}).execute()
-    document_id = doc.get("documentId")
-
-    # Insert content in chunks to avoid Google Docs API limits.
-    # Chunks must be inserted in REVERSE order because each insert at index 1
-    # pushes previous text forward.
-    chunks = [content[i:i + GOOGLE_DOCS_CHUNK_SIZE] for i in range(0, len(content), GOOGLE_DOCS_CHUNK_SIZE)]
-    for i, chunk in enumerate(reversed(chunks)):
-        requests = [
-            {
-                "insertText": {
-                    "location": {"index": 1},
-                    "text": chunk,
-                }
-            }
-        ]
-        docs_service.documents().batchUpdate(
-            documentId=document_id, body={"requests": requests}
-        ).execute()
-    print(f"✅ Content written to document ({len(chunks)} chunk{'s' if len(chunks) > 1 else ''}).")
-
-    # Move to the target folder
-    folder_id = os.environ["GOOGLE_FOLDER_ID"]
-    try:
-        file_metadata = drive_service.files().get(
-            fileId=document_id, fields="parents"
-        ).execute()
-        previous_parents = ",".join(file_metadata.get("parents", []))
-        drive_service.files().update(
-            fileId=document_id,
-            addParents=folder_id,
-            removeParents=previous_parents,
-            fields="id, parents",
-        ).execute()
-        print(f"📂 Moved to folder: {folder_id}")
-    except Exception as e:
-        # Document exists but is orphaned in root — log but don't crash
-        print(f"⚠️ WARNING: Doc created (ID: {document_id}) but folder move failed: {e}")
-        print(f"   The document exists in the service account's root Drive.")
-
-    doc_url = f"https://docs.google.com/document/d/{document_id}/edit"
-    print(f"🔗 Document URL: {doc_url}")
-    return document_id
+    return report_path
 
 
 # ──────────────────────────────────────────────
@@ -250,10 +193,10 @@ if __name__ == "__main__":
     try:
         validate_environment()
         report = generate_report()
-        upload_to_google_docs(report)
-        print("\n✅ Pipeline complete. Report delivered to Google Docs.")
+        save_report(report)
+        print("\n✅ Pipeline complete. Report saved to reports/ directory.")
     except SystemExit:
-        raise  # Let sys.exit() propagate with its code
+        raise
     except Exception as e:
         print(f"\n❌ UNHANDLED ERROR:\n{traceback.format_exc()}")
         sys.exit(1)

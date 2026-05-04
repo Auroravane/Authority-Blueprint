@@ -1,6 +1,2 @@
 # Pinned for reproducibility — matches .github/workflows/daily_report.yml
 openai==1.82.0
-google-api-python-client==2.172.0
-google-auth==2.40.3
-google-auth-httplib2==0.2.0
-google-auth-oauthlib==1.2.1
