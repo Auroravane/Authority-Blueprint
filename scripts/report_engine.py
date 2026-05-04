@@ -27,6 +27,13 @@ TOP_P = 0.7
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 30
 
+# Google Docs batchUpdate has a practical character limit per insertText request.
+# We chunk content at this boundary to avoid silent truncation or 400 errors.
+GOOGLE_DOCS_CHUNK_SIZE = 40000
+
+# JST offset for consistent date/time across the pipeline
+JST_OFFSET = datetime.timedelta(hours=9)
+
 REQUIRED_ENV_VARS = ["NVIDIA_API_KEY", "GOOGLE_CREDENTIALS", "GOOGLE_FOLDER_ID"]
 
 GOOGLE_SCOPES = [
@@ -34,17 +41,48 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# Errors that should NOT be retried — failing fast saves 90s of pointless waiting
+NON_RETRYABLE_ERRORS = (
+    "401",          # Bad API key
+    "403",          # Forbidden / quota exceeded
+    "invalid_api",  # NVIDIA-specific auth failure
+)
+
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+def jst_now() -> datetime.datetime:
+    """Return the current time in JST (UTC+9)."""
+    return datetime.datetime.utcnow() + JST_OFFSET
+
+
+def jst_today() -> datetime.date:
+    """Return today's date in JST (UTC+9)."""
+    return jst_now().date()
+
 
 # ──────────────────────────────────────────────
 # GUARDS
 # ──────────────────────────────────────────────
 def validate_environment():
-    """Fail fast if any required secret is missing."""
+    """Fail fast if any required secret is missing or malformed."""
     missing = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
     if missing:
         print(f"❌ FATAL: Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
-    print("✅ All environment variables present.")
+
+    # Validate GOOGLE_CREDENTIALS is parseable JSON before we reach the upload step
+    try:
+        creds = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+        if "client_email" not in creds or "private_key" not in creds:
+            raise ValueError("JSON is valid but missing 'client_email' or 'private_key' fields.")
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"❌ FATAL: GOOGLE_CREDENTIALS is not valid service account JSON: {e}")
+        print("   Ensure you pasted the FULL contents of the .json key file into the GitHub Secret.")
+        sys.exit(1)
+
+    print("✅ All environment variables present and validated.")
 
 
 def resolve_prompt_path() -> Path:
@@ -56,6 +94,15 @@ def resolve_prompt_path() -> Path:
         print(f"❌ FATAL: SystemPrompt.md not found at {prompt_path}")
         sys.exit(1)
     return prompt_path
+
+
+def is_retryable(error: Exception) -> bool:
+    """Check if an error is worth retrying or should fail immediately."""
+    error_str = str(error).lower()
+    for marker in NON_RETRYABLE_ERRORS:
+        if marker.lower() in error_str:
+            return False
+    return True
 
 
 # ──────────────────────────────────────────────
@@ -72,7 +119,7 @@ def generate_report() -> str:
         api_key=os.environ["NVIDIA_API_KEY"],
     )
 
-    today = datetime.date.today().strftime("%A, %B %d, %Y")
+    today = jst_today().strftime("%A, %B %d, %Y")
     user_message = (
         f"Today is {today}. "
         "Generate today's Market Intelligence Report following Format A: Weekly Signal Report. "
@@ -109,6 +156,12 @@ def generate_report() -> str:
         except Exception as e:
             last_error = e
             print(f"⚠️ Attempt {attempt} failed: {type(e).__name__}: {e}")
+
+            # Don't retry auth or permission errors — they won't resolve on their own
+            if not is_retryable(e):
+                print(f"❌ FATAL: Non-retryable error detected. Aborting immediately.")
+                sys.exit(1)
+
             if attempt < MAX_RETRIES:
                 wait = RETRY_DELAY_SECONDS * attempt  # Linear backoff
                 print(f"   Retrying in {wait}s...")
@@ -137,25 +190,29 @@ def upload_to_google_docs(content: str) -> str:
     """Create a new Google Doc with the report content and move it to the target folder."""
     docs_service, drive_service = get_google_services()
 
-    # Create the document
-    title = f"ACHILLES Report — {datetime.date.today().strftime('%Y-%m-%d')}"
+    # Use JST date for the title so it matches the report's actual day in Japan
+    title = f"ACHILLES Report — {jst_today().strftime('%Y-%m-%d')}"
     print(f"📝 Creating Google Doc: '{title}'...")
     doc = docs_service.documents().create(body={"title": title}).execute()
     document_id = doc.get("documentId")
 
-    # Insert content into the document
-    requests = [
-        {
-            "insertText": {
-                "location": {"index": 1},
-                "text": content,
+    # Insert content in chunks to avoid Google Docs API limits.
+    # Chunks must be inserted in REVERSE order because each insert at index 1
+    # pushes previous text forward.
+    chunks = [content[i:i + GOOGLE_DOCS_CHUNK_SIZE] for i in range(0, len(content), GOOGLE_DOCS_CHUNK_SIZE)]
+    for i, chunk in enumerate(reversed(chunks)):
+        requests = [
+            {
+                "insertText": {
+                    "location": {"index": 1},
+                    "text": chunk,
+                }
             }
-        }
-    ]
-    docs_service.documents().batchUpdate(
-        documentId=document_id, body={"requests": requests}
-    ).execute()
-    print(f"✅ Content written to document.")
+        ]
+        docs_service.documents().batchUpdate(
+            documentId=document_id, body={"requests": requests}
+        ).execute()
+    print(f"✅ Content written to document ({len(chunks)} chunk{'s' if len(chunks) > 1 else ''}).")
 
     # Move to the target folder
     folder_id = os.environ["GOOGLE_FOLDER_ID"]
@@ -185,9 +242,9 @@ def upload_to_google_docs(content: str) -> str:
 # ENTRYPOINT
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    jst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    now = jst_now()
     print("=" * 60)
-    print(f"  ACHILLES Report Engine — {jst_now.strftime('%Y-%m-%d %H:%M JST')}")
+    print(f"  ACHILLES Report Engine — {now.strftime('%Y-%m-%d %H:%M JST')}")
     print("=" * 60)
 
     try:
