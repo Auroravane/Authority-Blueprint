@@ -1,0 +1,201 @@
+"""
+Project ACHILLES — Report Engine
+Generates a daily Market Intelligence Report using the NVIDIA NIM API
+and exports it to Google Docs.
+"""
+
+import os
+import sys
+import json
+import time
+import datetime
+import traceback
+from pathlib import Path
+from openai import OpenAI
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+
+# ──────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────
+MODEL = "mistralai/mistral-nemotron"
+BASE_URL = "https://integrate.api.nvidia.com/v1"
+MAX_TOKENS = 16384  # ACHILLES Format A reports are long; 4096 truncates them
+TEMPERATURE = 0.6
+TOP_P = 0.7
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 30
+
+REQUIRED_ENV_VARS = ["NVIDIA_API_KEY", "GOOGLE_CREDENTIALS", "GOOGLE_FOLDER_ID"]
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+# ──────────────────────────────────────────────
+# GUARDS
+# ──────────────────────────────────────────────
+def validate_environment():
+    """Fail fast if any required secret is missing."""
+    missing = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
+    if missing:
+        print(f"❌ FATAL: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+    print("✅ All environment variables present.")
+
+
+def resolve_prompt_path() -> Path:
+    """Resolve SystemPrompt.md relative to the repo root, not the script's CWD."""
+    # GitHub Actions checks out to GITHUB_WORKSPACE; local runs use repo root
+    repo_root = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parent.parent))
+    prompt_path = repo_root / "SystemPrompt.md"
+    if not prompt_path.exists():
+        print(f"❌ FATAL: SystemPrompt.md not found at {prompt_path}")
+        sys.exit(1)
+    return prompt_path
+
+
+# ──────────────────────────────────────────────
+# CORE: REPORT GENERATION
+# ──────────────────────────────────────────────
+def generate_report() -> str:
+    """Call NVIDIA NIM with the full ACHILLES system prompt. Retries on transient failures."""
+    prompt_path = resolve_prompt_path()
+    system_prompt = prompt_path.read_text(encoding="utf-8")
+    print(f"📄 Loaded system prompt: {len(system_prompt):,} characters from {prompt_path.name}")
+
+    client = OpenAI(
+        base_url=BASE_URL,
+        api_key=os.environ["NVIDIA_API_KEY"],
+    )
+
+    today = datetime.date.today().strftime("%A, %B %d, %Y")
+    user_message = (
+        f"Today is {today}. "
+        "Generate today's Market Intelligence Report following Format A: Weekly Signal Report. "
+        "Cover all four intelligence domains. Follow every constraint and output format exactly as specified."
+    )
+
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"🔄 Attempt {attempt}/{MAX_RETRIES} — Calling {MODEL}...")
+            completion = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                max_tokens=MAX_TOKENS,
+            )
+
+            content = completion.choices[0].message.content
+
+            # Validate response isn't empty or garbage
+            if not content or len(content.strip()) < 200:
+                raise ValueError(
+                    f"API returned suspiciously short response ({len(content) if content else 0} chars). "
+                    "Likely a model error or content filter."
+                )
+
+            print(f"✅ Report generated: {len(content):,} characters")
+            return content
+
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ Attempt {attempt} failed: {type(e).__name__}: {e}")
+            if attempt < MAX_RETRIES:
+                wait = RETRY_DELAY_SECONDS * attempt  # Linear backoff
+                print(f"   Retrying in {wait}s...")
+                time.sleep(wait)
+
+    # All retries exhausted
+    print(f"❌ FATAL: All {MAX_RETRIES} attempts failed. Last error: {last_error}")
+    sys.exit(1)
+
+
+# ──────────────────────────────────────────────
+# CORE: GOOGLE DOCS UPLOAD
+# ──────────────────────────────────────────────
+def get_google_services():
+    """Authenticate and return Google Docs + Drive service clients."""
+    creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_json, scopes=GOOGLE_SCOPES
+    )
+    docs_service = build("docs", "v1", credentials=creds)
+    drive_service = build("drive", "v3", credentials=creds)
+    return docs_service, drive_service
+
+
+def upload_to_google_docs(content: str) -> str:
+    """Create a new Google Doc with the report content and move it to the target folder."""
+    docs_service, drive_service = get_google_services()
+
+    # Create the document
+    title = f"ACHILLES Report — {datetime.date.today().strftime('%Y-%m-%d')}"
+    print(f"📝 Creating Google Doc: '{title}'...")
+    doc = docs_service.documents().create(body={"title": title}).execute()
+    document_id = doc.get("documentId")
+
+    # Insert content into the document
+    requests = [
+        {
+            "insertText": {
+                "location": {"index": 1},
+                "text": content,
+            }
+        }
+    ]
+    docs_service.documents().batchUpdate(
+        documentId=document_id, body={"requests": requests}
+    ).execute()
+    print(f"✅ Content written to document.")
+
+    # Move to the target folder
+    folder_id = os.environ["GOOGLE_FOLDER_ID"]
+    try:
+        file_metadata = drive_service.files().get(
+            fileId=document_id, fields="parents"
+        ).execute()
+        previous_parents = ",".join(file_metadata.get("parents", []))
+        drive_service.files().update(
+            fileId=document_id,
+            addParents=folder_id,
+            removeParents=previous_parents,
+            fields="id, parents",
+        ).execute()
+        print(f"📂 Moved to folder: {folder_id}")
+    except Exception as e:
+        # Document exists but is orphaned in root — log but don't crash
+        print(f"⚠️ WARNING: Doc created (ID: {document_id}) but folder move failed: {e}")
+        print(f"   The document exists in the service account's root Drive.")
+
+    doc_url = f"https://docs.google.com/document/d/{document_id}/edit"
+    print(f"🔗 Document URL: {doc_url}")
+    return document_id
+
+
+# ──────────────────────────────────────────────
+# ENTRYPOINT
+# ──────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print(f"  ACHILLES Report Engine — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print("=" * 60)
+
+    try:
+        validate_environment()
+        report = generate_report()
+        upload_to_google_docs(report)
+        print("\n✅ Pipeline complete. Report delivered to Google Docs.")
+    except SystemExit:
+        raise  # Let sys.exit() propagate with its code
+    except Exception as e:
+        print(f"\n❌ UNHANDLED ERROR:\n{traceback.format_exc()}")
+        sys.exit(1)
